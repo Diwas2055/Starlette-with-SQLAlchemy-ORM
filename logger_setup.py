@@ -1,8 +1,8 @@
+import asyncio
 import logging
-from logging.handlers import TimedRotatingFileHandler
 import os
-import concurrent.futures
-from functools import partial
+from logging.handlers import QueueHandler, QueueListener, TimedRotatingFileHandler
+from queue import Queue  # Using sync Queue as QueueListener works with this
 
 log_folder = "logs"
 info_log_file = os.path.join(log_folder, "info/info.log")
@@ -29,56 +29,73 @@ class SeverityFilter(logging.Filter):
         return record.levelno == self.severity
 
 
-# Asynchronous handler wrapper to use ThreadPoolExecutor
-class AsyncHandler(logging.Handler):
-    def __init__(self, handler, executor):
-        super().__init__()
-        self.handler = handler
-        self.executor = executor
-
-    def emit(self, record):
-        # Offload the logging task to a thread pool
-        self.executor.submit(self.handler.emit, record)
-
-
 # Set up logging
 logging.basicConfig(level=logging.NOTSET)
 
 # Create a formatter
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-# Create a ThreadPoolExecutor for non-blocking logging
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=5)
 
-# Create a TimedRotatingFileHandler for each level and attach a filter
-info_handler = TimedRotatingFileHandler(
-    filename=info_log_file, when="midnight", backupCount=7
-)
-info_handler.setLevel(logging.INFO)
-info_handler.setFormatter(formatter)
-info_handler.addFilter(SeverityFilter(logging.INFO))
+# Define a function to set up a TimedRotatingFileHandler
+def create_timed_rotating_handler(
+    log_file, level, formatter, when="midnight", backup_count=7
+):
+    handler = TimedRotatingFileHandler(
+        filename=log_file, when=when, backupCount=backup_count
+    )
+    handler.setLevel(level)
+    handler.setFormatter(formatter)
+    handler.addFilter(SeverityFilter(level))
+    return handler
 
-warning_handler = TimedRotatingFileHandler(
-    filename=warning_log_file, when="midnight", backupCount=7
-)
-warning_handler.setLevel(logging.WARNING)
-warning_handler.setFormatter(formatter)
-warning_handler.addFilter(SeverityFilter(logging.WARNING))
 
-error_handler = TimedRotatingFileHandler(
-    filename=error_log_file, when="midnight", backupCount=7
-)
-error_handler.setLevel(logging.ERROR)
-error_handler.setFormatter(formatter)
-error_handler.addFilter(SeverityFilter(logging.ERROR))
+# Helper coroutine to setup and manage the logger
+async def init_logger():
+    # Create handlers for each level using the reusable function
+    info_handler = create_timed_rotating_handler(info_log_file, logging.INFO, formatter)
+    warning_handler = create_timed_rotating_handler(
+        warning_log_file, logging.WARNING, formatter
+    )
+    error_handler = create_timed_rotating_handler(
+        error_log_file, logging.ERROR, formatter
+    )
 
-# Wrap the handlers with the AsyncHandler
-async_info_handler = AsyncHandler(info_handler, executor)
-async_warning_handler = AsyncHandler(warning_handler, executor)
-async_error_handler = AsyncHandler(error_handler, executor)
+    # Create a Queue for log records
+    log_queue = Queue()
 
-# Create a logger and attach asynchronous handlers
+    # Set up QueueHandler
+    queue_handler = QueueHandler(log_queue)
+
+    # Add the QueueHandler to the logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.NOTSET)  # Ensure logger captures all levels
+    logger.handlers = []  # Clear any existing handlers to avoid duplicates
+    logger.addHandler(queue_handler)
+
+    # Set up QueueListener with the actual handlers
+    listener = QueueListener(log_queue, info_handler, warning_handler, error_handler)
+
+    # Add StreamHandler for console logging
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)  # Set to DEBUG for console
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    try:
+        # Start the listener
+        listener.start()
+        # Report the logger is ready
+        logging.debug("Logger has started")
+        # Wait forever to keep the logger running
+        while True:
+            await asyncio.sleep(60)
+    finally:
+        # Report the logger is done
+        logging.debug("Logger is shutting down")
+        # Ensure the listener is closed
+        listener.stop()
+
+
+# Initialize the logger
+log_task = asyncio.create_task(init_logger())
 logger = logging.getLogger()
-logger.addHandler(async_info_handler)
-logger.addHandler(async_warning_handler)
-logger.addHandler(async_error_handler)
