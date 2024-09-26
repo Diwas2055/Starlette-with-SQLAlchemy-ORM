@@ -1,0 +1,7 @@
+starlette
+sqlalchemy[asyncio]
+databases
+asyncpg
+psycopg2
+uvicorn[standard]
+pydantic
